@@ -318,7 +318,12 @@ SendZfsSnapshot() {
         local ziped="";
         IsTrue $backup_ziped && ziped="true"
 
-        zfs_send="$zfs_cmd send -R $zopt ${base_increment:+-i $base_increment }$1@$2 ${ziped:+| $zip_cmd -c }| $backup_host \"${ziped:+$unzip_cmd | }zfs recv -duv $backup_pool\"" #was $backup_pool$dataset
+	local remotecmd="";
+	if [ "$backup_host" != '' ]; then
+		remotecmd="\"";
+	fi
+
+        zfs_send="$zfs_cmd send -R $zopt ${base_increment:+-i $base_increment }$1@$2 ${ziped:+| $zip_cmd -c }| $backup_host $remotecmd${ziped:+$unzip_cmd | }zfs recv -duv $backup_pool$remotecmd" #was $backup_pool$dataset
 
         if IsFalse $dry_run; then
             if eval $zfs_send > /dev/stderr; then
