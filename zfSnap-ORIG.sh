@@ -20,9 +20,6 @@ zip_cmd='/bin/gzip'
 unzip_cmd='zcat'
 test_mode=${test_mode:="false"}
 
-SCRIPTNAME=`basename $0`
-PIDFILE=/var/run/${SCRIPTNAME}.pid
-
 # Exit programm with given status code
 Exit() {
     IsTrue $test_mode || exit $1
@@ -158,8 +155,8 @@ GENERIC OPTIONS:
   -z           = Force new snapshots to have 00 seconds!
   -zpool28fix  = Workaround for zpool v28 zfs destroy -r bug
   -rp policy   = Retention policy for existing snapshots (policy format : "1h,4;1w,11")
-                 meaning: keep 4 snapshots rotated every 1h 
-                 and 11 snapshots rotated every 1 week (out of the last 4 valid within 1h)
+                 meaning: keep 4 snapshots within the last 1 hour 
+                 and 11 snapshots within 1 week (out of the last 4 valid within 1h)
                  The order is important
                  Quotes are mandatory
                  This argument implies -d which is then unnecessary
@@ -300,7 +297,7 @@ SendZfsSnapshot() {
             zfs_remote_snapshots=`$backup_host zfs list -H -o name -t snapshot | grep -E -e "^$backup_pool$dataset@(${prefixes})?${date_pattern}--${htime_pattern}$"`
         fi
         local base_increment=""
-        local remote_snapshots="$(echo "$zfs_remote_snapshots" | xargs printf "%s\n" | $ESED -e "s/^.*@//g" | sort -u -r)"
+        local remote_snapshots=$(echo $zfs_remote_snapshots | xargs printf "%s\n" | $ESED -e "s/^.*@//" | sort -u -r)
 
          # check if we can go incremental: find the most recent snapshot also existing on remote
         for i in `echo $zfs_snapshots | xargs printf "%s\n" | $ESED -e "s/^.*@//" | sort -u -r`; do
@@ -318,7 +315,7 @@ SendZfsSnapshot() {
         local ziped="";
         IsTrue $backup_ziped && ziped="true"
 
-        zfs_send="$zfs_cmd send -R $zopt ${base_increment:+-i $base_increment }$1@$2 ${ziped:+| $zip_cmd -c }| $backup_host \"${ziped:+$unzip_cmd | }zfs recv -duv $backup_pool\"" #was $backup_pool$dataset
+        zfs_send="$zfs_cmd send $zopt ${base_increment:+-i $base_increment }$1@$2 ${ziped:+| $zip_cmd -c }| $backup_host \"${ziped:+$unzip_cmd | }zfs recv -F $backup_pool$dataset\""
 
         if IsFalse $dry_run; then
             if eval $zfs_send > /dev/stderr; then
@@ -366,7 +363,6 @@ backup_host=""                      # SSH host target to receive zfs
 backup_pool=""                      # remote pool name (could be on the same machine in no remote host specified
 backup_ziped="false"                # gzip remote zfs send
 retention=""                        # retention policy. Rename necessary snapshot before running delete snapshots
-snapshot_skip="false"               # Should I skip snapshoting pools.
 
 while [ "$1" = '-d' -o "$1" = '-v' -o "$1" = '-n' -o "$1" = '-F' -o "$1" = '-z' -o "$1" = '-s' -o "$1" = '-S' -o "$1" = '-e' -o "$1" = '-zpool28fix' -o "$1" = '-rp' ]; do
     case "$1" in
@@ -418,7 +414,6 @@ while [ "$1" = '-d' -o "$1" = '-v' -o "$1" = '-n' -o "$1" = '-F' -o "$1" = '-z' 
         ;;
 
     '-rp')
-        snapshot_skip="true"
         delete_snapshots="true"
         retention="$2"
         shift 2
@@ -451,157 +446,148 @@ readonly htime_pattern='([0-9]+y)?([0-9]+m)?([0-9]+w)?([0-9]+d)?([0-9]+h)?([0-9]
 
 IsTrue $dry_run && zfs_list=`$zfs_cmd list -H -o name`
 ntime=`date "+$tfrmt"`
-if IsFalse $snapshot_skip; then
-    while [ "$1" ]; do
-        while [ "$1" = '-r' -o "$1" = '-R' -o "$1" = '-a' -o "$1" = '-p' -o "$1" = '-P' -o "$1" = '-D' -o "$1" = '-bhost' -o "$1" = '-bpool' -o "$1" = '-bz' ]; do
-            case "$1" in
-            '-r')
-                zopt='-r'
-                shift
-                ;;
-            '-R')
-                zopt=''
-                shift
-                ;;
-            '-a')
-                ttl="$2"
-                echo "$ttl" | grep -q -E -e "^[0-9]+$" && ttl=`Seconds2TTL $ttl`
-                shift 2
-                ;;
-            '-p')
-                prefix="$2"
-                prefixes="$prefixes|$prefix"
-                shift 2
-                ;;
-            '-P')
-                prefix=""
-                shift
-                ;;
-            '-D')
-                if [ "$zopt" != '-r' ]; then
-                    delete_specific_fs_snapshots="$delete_specific_fs_snapshots $2"
-                else
-                    delete_specific_fs_snapshots_recursively="$delete_specific_fs_snapshots_recursively $2"
-                fi
-                shift 2
-                ;;
-            '-bhost')
-                backup_host="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -q $2"
-                shift 2
-                ;;
-            '-bpool')
-                backup_pool="$2"
-                shift 2
-                ;;
-            '-bz')
-                backup_ziped="true"
-                shift
-                ;;
-            esac
-        done
-
-        # create snapshots
-        if [ $1 ]; then
-            if SkipPool $1; then
-                if [ $1 = `echo $1 | $ESED -e 's/^-//'` ]; then
-                    zfs_snapshot="$zfs_cmd snapshot $zopt $1@${prefix}${ntime}--${ttl}${postfx}"
-                    if IsFalse $dry_run; then
-                        if $zfs_snapshot > /dev/stderr; then
-                            IsTrue $verbose && echo "$zfs_snapshot ... DONE"
-                        else
-                            IsTrue $verbose && echo "$zfs_snapshot ... FAIL"
-                            IsTrue $count_failures && failures=$(($failures + 1))
-                        fi
-                    else
-                        printf "%s\n" $zfs_list | grep -m 1 -q -E -e "^$1$" \
-                            && echo "$zfs_snapshot" \
-                            || Err "Looks like zfs filesystem '$1' doesn't exist"
-                    fi
-                    SendZfsSnapshot $1 ${prefix}${ntime}--${ttl}${postfx}
-                else
-                    Warn "'$1' doesn't look like valid argument. Ignoring"
-                fi
-            fi
+while [ "$1" ]; do
+    while [ "$1" = '-r' -o "$1" = '-R' -o "$1" = '-a' -o "$1" = '-p' -o "$1" = '-P' -o "$1" = '-D' -o "$1" = '-bhost' -o "$1" = '-bpool' -o "$1" = '-bz' ]; do
+        case "$1" in
+        '-r')
+            zopt='-r'
             shift
-        fi
+            ;;
+        '-R')
+            zopt=''
+            shift
+            ;;
+        '-a')
+            ttl="$2"
+            echo "$ttl" | grep -q -E -e "^[0-9]+$" && ttl=`Seconds2TTL $ttl`
+            shift 2
+            ;;
+        '-p')
+            prefix="$2"
+            prefixes="$prefixes|$prefix"
+            shift 2
+            ;;
+        '-P')
+            prefix=""
+            shift
+            ;;
+        '-D')
+            if [ "$zopt" != '-r' ]; then
+                delete_specific_fs_snapshots="$delete_specific_fs_snapshots $2"
+            else
+                delete_specific_fs_snapshots_recursively="$delete_specific_fs_snapshots_recursively $2"
+            fi
+            shift 2
+            ;;
+        '-bhost')
+            backup_host="ssh -q $2"
+            shift 2
+            ;;
+        '-bpool')
+            backup_pool="$2"
+            shift 2
+            ;;
+        '-bz')
+            backup_ziped="true"
+            shift
+            ;;
+        esac
     done
-fi
+
+    # create snapshots
+    if [ $1 ]; then
+        if SkipPool $1; then
+            if [ $1 = `echo $1 | $ESED -e 's/^-//'` ]; then
+                zfs_snapshot="$zfs_cmd snapshot $zopt $1@${prefix}${ntime}--${ttl}${postfx}"
+                if IsFalse $dry_run; then
+                    if $zfs_snapshot > /dev/stderr; then
+                        IsTrue $verbose && echo "$zfs_snapshot ... DONE"
+                    else
+                        IsTrue $verbose && echo "$zfs_snapshot ... FAIL"
+                        IsTrue $count_failures && failures=$(($failures + 1))
+                    fi
+                else
+                    printf "%s\n" $zfs_list | grep -m 1 -q -E -e "^$1$" \
+                        && echo "$zfs_snapshot" \
+                        || Err "Looks like zfs filesystem '$1' doesn't exist"
+                fi
+                SendZfsSnapshot $1 ${prefix}${ntime}--${ttl}${postfx}
+            else
+                Warn "'$1' doesn't look like valid argument. Ignoring"
+            fi
+        fi
+        shift
+    fi
+done
+
 prefixes=`echo "$prefixes" | sed -e 's/^\|//'`
 
 # manages retention policy if any, inspired from zetaback
-if [ "$retention" != "" ]; then
-    ## ensure retention runs only once at a time
-    if [ -f ${PIDFILE} ]; then
-       #verify if the process is actually still running under this pid
-       OLDPID=`cat ${PIDFILE}`
-       RESULT=`ps -ef | grep ${OLDPID} | grep ${SCRIPTNAME}`  
-
-       if [ -n "${RESULT}" ]; then
-         echo "Script already running! Exiting"
-         exit 255
-       fi
-
-    fi
-
-
-    #grab pid of this process and update the pid file with it
-    PID=`ps -ef | grep ${SCRIPTNAME} | head -n1 |  awk ' {print $2;} '`
-    echo ${PID} > ${PIDFILE}
-
+if [ $retention != "" ]; then
     current_time=`date +%s`
     snapshot_rename=""
     last_stay_time="0"
 
     for r in `echo "$retention" | $ESED -e "s/;/\n/g"`; do
-        generate_ttl=$(echo $r | $ESED -e "s/,.*$//")
-        generate_ttl_nb=$(echo $generate_ttl | $ESED -e "s/[a-Z]+//g")
-        generate_ttl_range=$(echo $generate_ttl | $ESED -e "s/[0-9]+//g")
+        keep_ttl=$(echo $r | $ESED -e "s/,.*$//")
+        stay_time=$(TTL2Seconds $keep_ttl)
         keep_count=$(echo $r | $ESED -e "s/^.*,//")
-        keep_ttl="$(($generate_ttl_nb * $keep_count))$generate_ttl_range"
-        keep_time=$(TTL2Seconds $keep_ttl)
-        generate_time=$(TTL2Seconds $generate_ttl)
-
-        echo "$generate_ttl count $keep_count = $keep_ttl / $keep_time"
+        echo "$keep_ttl count $keep_count = $stay_time"
+        # rename the outdated snapshots from parent policy 
+        count=1
+        for n in `echo $snapshot_rename | sort -u -r`; do
+            new=$(echo $n | $ESED -e "s/--${htime_pattern}$/--$keep_ttl/")
+            zfs_rename="$zfs_cmd rename -r $n $new"
+            if IsFalse $dry_run; then
+                if $zfs_rename > /dev/stderr; then
+                    IsTrue $verbose && echo "$zfs_rename ... DONE"
+                else
+                    IsTrue $verbose && echo "$zfs_rename ... FAIL"
+                    IsTrue $count_failures && failures=$(($failures + 1))
+                fi
+            else
+                echo "$zfs_rename"
+            fi
+            if [ $count -ge $keep_count ]; then
+                break
+            fi
+            count=$(($count+1))
+        done        
     
         # need to scan the new list in case of rename
-        zfs_snapshots=$($zfs_cmd list -H -o name -t snapshot | grep -E -e "^.*@(${prefixes})?${date_pattern}--${htime_pattern}$")
+        zfs_snapshots=$($backup_host zfs list -H -o name -t snapshot | grep -E -e "^.*@(${prefixes})?${date_pattern}--${htime_pattern}$")
+        snapshot_rename=""
         for i in `echo $zfs_snapshots | xargs printf "%s\n" | sort -u -r`; do
             create_time=$(getCreationTime $i)
-            stay_time=$(getStayTime $i)
-            # get most recent last rotated
-            zfs_rotated=$($zfs_cmd list -H -o name -t snapshot | grep -E -e "^.*@(${prefixes})?${date_pattern}--${keep_ttl}$" | sort -u -r )
-            
-            zfs_last_rotated=$(echo "$zfs_rotated" | $ESED -n 1p)          
-            if [ "$zfs_last_rotated" = "" ]; then
-                zfs_last_rotated_created=0
+            original_stay_time=$(getStayTime $i)
+            if [ $current_time -gt $(($create_time + $original_stay_time)) ] && [$current_time -gt $(($create_time + $stay_time)) -o $keep_count -le 0 ]; then
+                snapshot_rename="$snapshot_rename\n$i"
             else
-                zfs_last_rotated_created=$(getCreationTime $zfs_last_rotated)
-            fi
-            IsTrue $verbose && echo "last rotated: $zfs_last_rotated / $zfs_last_rotated_created" 
-
-            if [ $current_time -ge $(($zfs_last_rotated_created + $generate_time)) ]; then
-                if [ $current_time -ge $(($create_time + $stay_time)) ] && [ $create_time -gt $zfs_last_rotated_created ]; then
-                    new=$(echo "$i" | $ESED -e "s/--${htime_pattern}$/--$keep_ttl/")
-                    zfs_rename="$zfs_cmd rename $zopt $i $new"
-                    if IsFalse $dry_run; then
-                        if $zfs_rename > /dev/stderr; then
-                            IsTrue $verbose && echo "$zfs_rename ... DONE"
-                        else
-                            IsTrue $verbose && echo "$zfs_rename ... FAIL"
-                            IsTrue $count_failures && failures=$(($failures + 1))
-                        fi
-                    else
-                        echo "$zfs_rename"
-                    fi
+                if [ $current_time -gt $(($create_time + $last_stay_time)) ]; then
+                    keep_count=$(($keep_count-1))
+                    IsTrue $verbose && echo "keep $i"
                 fi                
             fi
         done
-
+        last_stay_time="$stay_time"
     done
 
-    if [ -f ${PIDFILE} ]; then
-        rm ${PIDFILE}
-    fi
+    # clean last retention
+    for n in `echo $snapshot_rename | sort -u -r`; do
+        new=$(echo $n | $ESED -e "s/--${htime_pattern}$/--1d/")
+        zfs_rename="$zfs_cmd destroy -r $n"
+        if IsFalse $dry_run; then
+            if $zfs_rename > /dev/stderr; then
+                IsTrue $verbose && echo "$zfs_rename ... DONE"
+            else
+                IsTrue $verbose && echo "$zfs_rename ... FAIL"
+                IsTrue $count_failures && failures=$(($failures + 1))
+            fi
+        else
+            echo "$zfs_rename"
+        fi
+    done 
+
 fi
 
 # delete snapshots
